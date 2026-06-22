@@ -626,6 +626,12 @@ return {
 		block_decorator = true,
 		use_virt_lines = false,
 
+		--- Behavior when `wrap` is on and the table is wider than the window.
+		---  false      -> don't render (default, avoids broken borders),
+		---  "normal"   -> render inline anyway,
+		---  "virtual"  -> redraw as a virtual block with wrapped cells.
+		wrap = false,
+
 		parts = {
 			top = { "╭", "─", "╮", "┬" },
 			header = { "│", "│", "│" },

@@ -24,6 +24,12 @@ end
 ---@type table[]
 markdown.cache = {};
 
+--- Source line ranges `{ row_start, row_end }` of the tables that are drawn as
+--- virtual blocks, per buffer. Used to reveal the raw table while the cursor is
+--- inside it (see the `CursorMoved` handler in `autocmds.lua`).
+---@type table<integer, [ integer, integer ][]>
+markdown.vtable_regions = {};
+
 ---@type integer Namespace for markdown.
 markdown.ns = vim.api.nvim_create_namespace("markview/markdown");
 
@@ -1517,6 +1523,546 @@ markdown.setext_heading = function (buffer, item)
 	end
 end
 
+--- Cached result of the `conceal_lines` capability probe.
+---@type boolean?
+markdown.virtual_wrap_supported = nil;
+
+--- Whether the running Neovim can conceal entire lines, which the virtual
+--- table renderer needs to hide the real (source) table lines.
+---@return boolean
+markdown.can_virtual_wrap = function ()
+	if markdown.virtual_wrap_supported ~= nil then
+		return markdown.virtual_wrap_supported;
+	end
+
+	local ok = pcall(function ()
+		local b = vim.api.nvim_create_buf(false, true);
+		vim.api.nvim_buf_set_lines(b, 0, -1, false, { "x" });
+		vim.api.nvim_buf_set_extmark(b, markdown.ns, 0, 0, { conceal_lines = "" });
+		vim.api.nvim_buf_delete(b, { force = true });
+	end);
+
+	markdown.virtual_wrap_supported = ok;
+	return ok;
+end
+
+--- Whether the cursor (in the window showing {buffer}) is inside the source
+--- range of a table.
+---@param buffer integer
+---@param range markview.parsed.range
+---@return boolean
+markdown.cursor_in_range = function (buffer, range)
+	local win = utils.buf_getwin(buffer);
+
+	if type(win) ~= "number" then
+		return false;
+	end
+
+	local ok, pos = pcall(vim.api.nvim_win_get_cursor, win);
+
+	if not ok then
+		return false;
+	end
+
+	local crow = pos[1] - 1;
+	return crow >= range.row_start and crow < range.row_end;
+end
+
+--- Takes the longest prefix of {text} whose display width is `<= width`.
+---@param text string
+---@param width integer
+---@return string prefix
+local function take_display (text, width)
+	local chars = vim.fn.split(text, "\\zs");
+	local out, w = "", 0;
+
+	for _, ch in ipairs(chars) do
+		local cw = vim.fn.strdisplaywidth(ch);
+
+		if w + cw > width then
+			break;
+		end
+
+		out = out .. ch;
+		w = w + cw;
+	end
+
+	if out == "" then
+		--- Always make progress, even if a single character is wider than {width}.
+		out = chars[1] or text;
+	end
+
+	return out;
+end
+
+--- A styled run of cell text.
+---@class markview.markdown.cell_chunk
+---@field text string
+---@field hl string?      Highlight group (raw, resolve with `utils.set_hl`).
+---@field code boolean?   Whether this is an inline code span (gets padding).
+
+--- Tokenizes a table cell into styled chunks, recognising code spans, bold,
+--- italic & strikethrough. Everything else is kept as plain text.
+---@param text string
+---@return markview.markdown.cell_chunk[]
+local function cell_chunks (text)
+	local code_hl = spec.get({ "markdown_inline", "inline_codes", "hl" }, { fallback = "MarkviewInlineCode" });
+
+	local chunks = {};
+	local plain = "";
+	local i, n = 1, #text;
+
+	local function flush ()
+		if plain ~= "" then
+			table.insert(chunks, { text = plain });
+			plain = "";
+		end
+	end
+
+	--- Emits a styled span delimited by {open}/{close}, returns the new index
+	--- or `nil` if there is no matching close marker.
+	local function span (open, close, group, is_code)
+		if text:sub(i, i + #open - 1) ~= open then
+			return nil;
+		end
+
+		local from = i + #open;
+		local stop = text:find(close, from, true);
+
+		if not stop or stop < from then
+			return nil;
+		end
+
+		flush();
+		table.insert(chunks, { text = text:sub(from, stop - 1), hl = group, code = is_code });
+		return stop + #close;
+	end
+
+	while i <= n do
+		local nxt =
+			span("`", "`", code_hl, true) or
+			span("**", "**", "@markup.strong") or
+			span("__", "__", "@markup.strong") or
+			span("~~", "~~", "@markup.strikethrough") or
+			span("*", "*", "@markup.italic") or
+			span("_", "_", "@markup.italic");
+
+		if nxt then
+			i = nxt;
+		else
+			plain = plain .. text:sub(i, i);
+			i = i + 1;
+		end
+	end
+
+	flush();
+	return chunks;
+end
+
+--- Total display width of a list of styled chunks (code spans include padding).
+---@param chunks markview.markdown.cell_chunk[]
+---@return integer
+local function chunks_width (chunks)
+	local w = 0;
+
+	for _, ch in ipairs(chunks) do
+		w = w + vim.fn.strdisplaywidth(ch.text) + (ch.code and 2 or 0);
+	end
+
+	return w;
+end
+
+--- Wraps styled {chunks} to {width} display cells. Returns a list of visual
+--- lines, each a list of `[ text, hl ]` segments (hl is a raw group name).
+---@param chunks markview.markdown.cell_chunk[]
+---@param width integer
+---@return [ string, string? ][][]
+local function wrap_chunks (chunks, width)
+	if width < 1 then
+		width = 1;
+	end
+
+	--- Flatten into tokens: plain runs become words + single spaces, styled
+	--- spans stay atomic (code spans get their padding here).
+	local tokens = {};
+
+	for _, ch in ipairs(chunks) do
+		if ch.hl then
+			local t = ch.code and (" " .. ch.text .. " ") or ch.text;
+			table.insert(tokens, { text = t, hl = ch.hl });
+		else
+			local s, pos = ch.text, 1;
+
+			while pos <= #s do
+				local a, b = s:find("%s+", pos);
+
+				if a == pos then
+					table.insert(tokens, { text = " ", space = true });
+					pos = b + 1;
+				else
+					local stop = (a and a - 1) or #s;
+					table.insert(tokens, { text = s:sub(pos, stop) });
+					pos = stop + 1;
+				end
+			end
+		end
+	end
+
+	local lines, cur, cur_w = {}, {}, 0;
+
+	local function push ()
+		table.insert(lines, cur);
+		cur, cur_w = {}, 0;
+	end
+
+	for _, tok in ipairs(tokens) do
+		local tw = vim.fn.strdisplaywidth(tok.text);
+
+		if tok.space then
+			if cur_w > 0 then
+				if cur_w + tw > width then
+					push();
+				else
+					table.insert(cur, { tok.text });
+					cur_w = cur_w + tw;
+				end
+			end
+		elseif tw > width then
+			--- Hard-break a token wider than the column.
+			if cur_w > 0 then push(); end
+
+			local rem = tok.text;
+
+			while vim.fn.strdisplaywidth(rem) > width do
+				local take = take_display(rem, width);
+				table.insert(lines, { { take, tok.hl } });
+				rem = rem:sub(#take + 1);
+			end
+
+			if rem ~= "" then
+				table.insert(cur, { rem, tok.hl });
+				cur_w = vim.fn.strdisplaywidth(rem);
+			end
+		else
+			if cur_w + tw > width then
+				push();
+			end
+
+			table.insert(cur, { tok.text, tok.hl });
+			cur_w = cur_w + tw;
+		end
+	end
+
+	if cur_w > 0 or #lines == 0 then
+		push();
+	end
+
+	return lines;
+end
+
+--- Total display width of a list of `[ text, hl ]` segments.
+---@param segs [ string, string? ][]
+---@return integer
+local function segs_width (segs)
+	local w = 0;
+
+	for _, s in ipairs(segs) do
+		w = w + vim.fn.strdisplaywidth(s[1]);
+	end
+
+	return w;
+end
+
+--- Renders a table as a virtual block with the contents wrapped inside each
+--- cell. Used when `wrap` is on, the table is wider than the window and
+--- `tables.wrap == "virtual"`.
+---
+--- Inline markup (code spans, bold, italic, strikethrough) is re-styled inside
+--- the wrapped cells; other inline elements (links, …) render as plain text.
+---@param buffer integer
+---@param item markview.parsed.markdown.tables
+---@param config markview.config.markdown.tables
+---@param win_width integer
+markdown.table_virtual = function (buffer, item, config, win_width)
+	---|fS
+
+	local range = item.range;
+	local aligns = item.alignments or {};
+
+	--- Tokenizes every `column` cell of a parsed row into styled chunks.
+	---@param row table[]
+	---@return markview.markdown.cell_chunk[][]
+	local function cells_of (row)
+		local cells = {};
+
+		for _, part in ipairs(row or {}) do
+			if part.class == "column" then
+				table.insert(cells, cell_chunks(vim.trim(part.text or "")));
+			end
+		end
+
+		return cells;
+	end
+
+	local header = cells_of(item.header);
+	local rows = {};
+
+	for _, row in ipairs(item.rows) do
+		table.insert(rows, cells_of(row));
+	end
+
+	local ncols = #header;
+
+	if ncols == 0 then
+		return;
+	end
+
+	--- Natural (unwrapped) display width of every column.
+	local natural = {};
+
+	for c = 1, ncols do
+		natural[c] = chunks_width(header[c] or {});
+	end
+
+	for _, row in ipairs(rows) do
+		for c = 1, ncols do
+			natural[c] = math.max(natural[c], chunks_width(row[c] or {}));
+		end
+	end
+
+	--- Budget for cell *content* (excluding borders & per-cell padding).
+	--- Layout per row: `│` + (` ` + content + ` ` + `│`) * ncols.
+	local win = utils.buf_getwin(buffer);
+	local textoff = win and (vim.fn.getwininfo(win)[1] or {}).textoff or 0;
+
+	local frame = 1 + (ncols * 3); -- left border + (2 pad + 1 border) per column.
+	local budget = (win_width - range.col_start - textoff) - frame;
+	local min_w = 4;
+
+	if budget < ncols * min_w then
+		budget = ncols * min_w;
+	end
+
+	--- Distribute the budget across columns using max-min fairness: columns
+	--- narrower than their fair share keep their natural width, and the rest is
+	--- split fairly among the wide columns (never below `min_w`).
+	local target = {};
+	local pending = {};
+
+	for c = 1, ncols do
+		pending[c] = true;
+	end
+
+	local remaining = budget;
+	local pending_count = ncols;
+
+	while pending_count > 0 do
+		local fair = math.max(min_w, math.floor(remaining / pending_count));
+		local settled = false;
+
+		for c = 1, ncols do
+			if pending[c] and natural[c] <= fair then
+				target[c] = natural[c];
+				remaining = remaining - natural[c];
+				pending[c] = nil;
+				pending_count = pending_count - 1;
+				settled = true;
+			end
+		end
+
+		if not settled then
+			--- The remaining columns are all wider than the fair share; cap them.
+			for c = 1, ncols do
+				if pending[c] then
+					target[c] = fair;
+					remaining = remaining - fair;
+					pending[c] = nil;
+					pending_count = pending_count - 1;
+				end
+			end
+		end
+	end
+
+	--- Hand any rounding leftover to the columns that are still truncated.
+	while remaining > 0 do
+		local grew = false;
+
+		for c = 1, ncols do
+			if remaining <= 0 then
+				break;
+			elseif target[c] < natural[c] then
+				target[c] = target[c] + 1;
+				remaining = remaining - 1;
+				grew = true;
+			end
+		end
+
+		if not grew then
+			break;
+		end
+	end
+
+	---@type [ string, string? ][][] Accumulated virtual lines.
+	local vlines = {};
+
+	local function hl (group)
+		return group and utils.set_hl(group) or nil;
+	end
+
+	--- Builds a horizontal border line from a 4-part spec `{ left, fill, right, joiner }`.
+	local function hborder (parts, hls)
+		local segs = { { parts[1], hl(hls[1]) } };
+
+		for c = 1, ncols do
+			table.insert(segs, { string.rep(parts[2], target[c] + 2), hl(hls[2]) });
+
+			if c < ncols then
+				table.insert(segs, { parts[4], hl(hls[4]) });
+			else
+				table.insert(segs, { parts[3], hl(hls[3]) });
+			end
+		end
+
+		return segs;
+	end
+
+	--- Builds the content sub-lines for a row using a 3-part vertical spec
+	--- `{ left, mid, right }`. {text_hl} is the fallback highlight for plain
+	--- (un-styled) text — used to colour header cells.
+	local function content_lines (cells, vparts, vhls, text_hl)
+		local default_hl = text_hl and hl(text_hl) or nil;
+		local wrapped, height = {}, 1;
+
+		for c = 1, ncols do
+			wrapped[c] = wrap_chunks(cells[c] or {}, target[c]);
+			height = math.max(height, #wrapped[c]);
+		end
+
+		local out = {};
+
+		for k = 1, height do
+			local segs = { { vparts[1], hl(vhls[1]) } };
+
+			for c = 1, ncols do
+				local cell = wrapped[c][k] or {};
+				local pad = math.max(0, target[c] - segs_width(cell));
+				local lpad, rpad;
+
+				if aligns[c] == "right" then
+					lpad, rpad = pad, 0;
+				elseif aligns[c] == "center" then
+					lpad = math.floor(pad / 2);
+					rpad = pad - lpad;
+				else
+					lpad, rpad = 0, pad;
+				end
+
+				table.insert(segs, { " " .. string.rep(" ", lpad), default_hl });
+
+				for _, seg in ipairs(cell) do
+					table.insert(segs, { seg[1], seg[2] and hl(seg[2]) or default_hl });
+				end
+
+				table.insert(segs, { string.rep(" ", rpad) .. " ", default_hl });
+				table.insert(segs, { c < ncols and vparts[2] or vparts[3], hl(c < ncols and vhls[2] or vhls[3]) });
+			end
+
+			table.insert(out, segs);
+		end
+
+		return out;
+	end
+
+	local parts = config.parts or {};
+	local hls = config.hl or {};
+
+	if config.block_decorator == true and parts.top then
+		table.insert(vlines, hborder(parts.top, hls.top or {}));
+	end
+
+	for _, line in ipairs(content_lines(header, parts.header or { "│", "│", "│" }, hls.header or {}, (hls.header or {})[1])) do
+		table.insert(vlines, line);
+	end
+
+	if parts.separator then
+		table.insert(vlines, hborder(parts.separator, hls.separator or {}));
+	end
+
+	for _, row in ipairs(rows) do
+		for _, line in ipairs(content_lines(row, parts.row or { "│", "│", "│" }, hls.row or {}, nil)) do
+			table.insert(vlines, line);
+		end
+	end
+
+	if config.block_decorator == true and parts.bottom then
+		table.insert(vlines, hborder(parts.bottom, hls.bottom or {}));
+	end
+
+	--- Indent virtual lines to match the table's starting column.
+	if range.col_start > 0 then
+		for _, line in ipairs(vlines) do
+			table.insert(line, 1, { string.rep(" ", range.col_start) });
+		end
+	end
+
+	if #vlines == 0 then
+		return;
+	end
+
+	--- NOTE: `virt_lines` attached to a `conceal_lines`-concealed line are
+	--- themselves hidden, and an inline-concealed *host* line still occupies an
+	--- (empty) screen row. So, whenever possible, we anchor the whole block on
+	--- the line *above* the table (which stays visible) and conceal every source
+	--- line of the table. Only when the table starts at the very top of the
+	--- buffer do we fall back to hosting the first rendered row on the first
+	--- table line via `virt_text`.
+	if range.row_start > 0 then
+		vim.api.nvim_buf_set_extmark(buffer, markdown.ns, range.row_start - 1, 0, {
+			undo_restore = false, invalidate = true,
+			virt_lines = vlines,
+			virt_lines_above = false,
+		});
+
+		for row = range.row_start, range.row_end - 1, 1 do
+			vim.api.nvim_buf_set_extmark(buffer, markdown.ns, row, 0, {
+				undo_restore = false, invalidate = true,
+				conceal_lines = "",
+			});
+		end
+	else
+		local first_src = vim.api.nvim_buf_get_lines(buffer, range.row_start, range.row_start + 1, false)[1] or "";
+		local rest = {};
+
+		for i = 2, #vlines, 1 do
+			table.insert(rest, vlines[i]);
+		end
+
+		vim.api.nvim_buf_set_extmark(buffer, markdown.ns, range.row_start, 0, {
+			undo_restore = false, invalidate = true,
+
+			end_col = #first_src,
+			conceal = "",
+
+			virt_text = vlines[1],
+			virt_text_pos = "inline",
+
+			virt_lines = rest,
+			virt_lines_above = false,
+
+			hl_mode = "combine",
+		});
+
+		for row = range.row_start + 1, range.row_end - 1, 1 do
+			vim.api.nvim_buf_set_extmark(buffer, markdown.ns, row, 0, {
+				undo_restore = false, invalidate = true,
+				conceal_lines = "",
+			});
+		end
+	end
+
+	---|fE
+end
+
 --- Renders tables.
 ---@param buffer integer
 ---@param item markview.parsed.markdown.tables
@@ -1663,9 +2209,36 @@ markdown.table = function (buffer, item)
 		end
 
 		if table_width >= width * 0.9 then
-			--- Most likely the text was wrapped somewhere.
+			--- Most likely the text would be wrapped somewhere.
 			--- TODO, Check if a more accurate(& faster) method exists or not.
-			return;
+			local wrap_mode = config.wrap;
+
+			if wrap_mode == "virtual" and markdown.can_virtual_wrap() then
+				--- Record the source range so the cursor handler knows where the
+				--- virtual table lives (regardless of whether it is concealed now).
+				markdown.vtable_regions[buffer] = markdown.vtable_regions[buffer] or {};
+				table.insert(markdown.vtable_regions[buffer], { range.row_start, range.row_end });
+
+				if markdown.cursor_in_range(buffer, range) then
+					--- Reveal the raw table while the cursor is inside it, so the
+					--- cursor doesn't traverse concealed (hidden) source lines.
+					if vim.api.nvim_buf_is_valid(buffer) then
+						vim.b[buffer].__markview_vt_inside = true;
+					end
+
+					return;
+				end
+
+				--- Redraw the whole table as a virtual block with wrapped cells.
+				return markdown.table_virtual(buffer, item, config, width);
+			elseif wrap_mode == true or wrap_mode == "normal" or wrap_mode == "virtual" then
+				--- Render inline anyway. ("virtual" falls back here when the
+				--- running Neovim cannot conceal whole lines.)
+				--- Fall through to the normal rendering below.
+			else
+				--- Legacy behavior: skip rendering to avoid broken borders.
+				return;
+			end
 		end
 	end
 
@@ -2718,6 +3291,14 @@ end
 ---@return markview.parsed
 markdown.render = function (buffer, content)
 	markdown.cache = {};
+	markdown.vtable_regions[buffer] = {};
+
+	--- Reset the "cursor inside a virtual table" flag; `markdown.table` sets it
+	--- back to `true` if it reveals a table this pass. Kept in sync here so the
+	--- cursor handler always has an accurate previous state.
+	if vim.api.nvim_buf_is_valid(buffer) then
+		vim.b[buffer].__markview_vt_inside = false;
+	end
 
 	local custom = spec.get({ "renderers" }, { fallback = {} });
 

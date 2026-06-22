@@ -316,6 +316,11 @@
 ---@field block_decorator boolean Whether to draw top & bottom border.
 ---@field use_virt_lines boolean Whether to use virtual lines for the borders.
 ---
+---@field wrap? boolean | "normal" | "virtual" Behavior when `wrap` is on and the table is wider than the window.
+--- - `nil`/`false`: legacy behavior, the table is **not** rendered (avoids broken borders).
+--- - `true`/`"normal"`: render the table inline anyway (rows wider than the window will wrap with misaligned borders).
+--- - `"virtual"`: redraw the table as a virtual block with content wrapped inside each cell (requires Neovim with `conceal_lines` support; falls back to `"normal"` otherwise).
+---
 ---@field hl markview.config.markdown.tables.parts Highlight groups for the parts.
 ---@field parts markview.config.markdown.tables.parts Parts for the table.
 

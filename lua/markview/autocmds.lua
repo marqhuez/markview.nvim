@@ -318,6 +318,117 @@ autocmds.optionSet = function (args)
 end
 
 ---@diagnostic disable-next-line: undefined-field
+autocmds.vtable_timer = vim.uv.new_timer();
+
+--[[ Reveals the raw source of a virtually-wrapped table while the cursor is
+inside it (and re-hides it on leaving). markview skips the normal cursor
+re-render when hybrid mode is off, so wrapped tables need their own handler. ]]
+---@param args vim.api.keyset.create_autocmd.callback_args
+autocmds.vtableCursor = function (args)
+	---|fS
+
+	local md = package.loaded["markview.renderers.markdown"];
+
+	if not md or not md.vtable_regions then
+		return;
+	end
+
+	local regions = md.vtable_regions[args.buf];
+
+	if not regions or #regions == 0 then
+		return;
+	end
+
+	local ok, pos = pcall(vim.api.nvim_win_get_cursor, 0);
+
+	if not ok then
+		return;
+	end
+
+	local crow = pos[1] - 1;
+	local inside = false;
+
+	for _, r in ipairs(regions) do
+		if crow >= r[1] and crow < r[2] then
+			inside = true;
+			break;
+		end
+	end
+
+	local prev = vim.b[args.buf].__markview_vt_inside == true;
+
+	if inside == prev then
+		return;
+	end
+
+	--- `markdown.render` updates `__markview_vt_inside` to reflect what was
+	--- actually drawn, so we don't write it here — just trigger the re-render.
+	autocmds.vtable_timer:stop();
+	autocmds.vtable_timer:start(20, 0, vim.schedule_wrap(function ()
+		local state = require("markview.state");
+		local actions = require("markview.actions");
+
+		if vim.api.nvim_buf_is_valid(args.buf) and state.buf_attached(args.buf) and state.enabled() and actions.in_preview_mode() then
+			actions.render(args.buf);
+		end
+	end));
+
+	---|fE
+end
+
+---@diagnostic disable-next-line: undefined-field
+autocmds.resize_timer = vim.uv.new_timer();
+
+--[[ Window(s) resized. Re-renders affected buffers as some decorations
+(e.g. wrapped tables) depend on the window width. ]]
+---@param args vim.api.keyset.create_autocmd.callback_args
+autocmds.winResized = function (args)
+	---|fS
+
+	local state = require("markview.state");
+	local actions = require("markview.actions");
+
+	--- `WinResized` reports the affected windows, `VimResized` does not.
+	local windows = (vim.v.event or {}).windows or vim.api.nvim_list_wins();
+
+	--- Collect the unique, attached & enabled buffers shown in those windows.
+	local buffers = {};
+
+	for _, win in ipairs(windows) do
+		if vim.api.nvim_win_is_valid(win) then
+			local buf = vim.api.nvim_win_get_buf(win);
+			local buf_state = state.get_buffer_state(buf, false);
+
+			if state.buf_attached(buf) and buf_state and buf_state.enable then
+				buffers[buf] = true;
+			end
+		end
+	end
+
+	if vim.tbl_isempty(buffers) then
+		return;
+	end
+
+	--- Debounce: resizing fires rapidly.
+	autocmds.resize_timer:stop();
+	autocmds.resize_timer:start(75, 0, vim.schedule_wrap(function ()
+		if not state.enabled() or not actions.in_preview_mode() then
+			return;
+		end
+
+		for buf, _ in pairs(buffers) do
+			if state.buf_attached(buf) and buf == state.get_splitview_source() then
+				--- Handled separately by the splitview renderer.
+			elseif state.buf_attached(buf) then
+				actions.render(buf);
+			end
+		end
+	end));
+
+	---|fE
+end
+
+---@diagnostic disable-next-line: undefined-field
 autocmds.cursor_timer = vim.uv.new_timer();
 
 --[[ Cursor moved. ]]
@@ -521,8 +632,20 @@ autocmds.setup = function ()
 		callback = autocmds.cursor
 	});
 
+	vim.api.nvim_create_autocmd({
+		"CursorMoved", "CursorMovedI"
+	}, {
+		callback = autocmds.vtableCursor
+	});
+
 	vim.api.nvim_create_autocmd("FileChangedShellPost", {
 		callback = autocmds.file_changed
+	});
+
+	vim.api.nvim_create_autocmd({
+		"WinResized", "VimResized"
+	}, {
+		callback = autocmds.winResized
 	});
 
 	vim.api.nvim_create_autocmd({
